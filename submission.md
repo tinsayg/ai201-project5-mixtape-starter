@@ -1,5 +1,23 @@
 # Project 5 Submission — Mixtape Bug Hunt
 
+## AI Usage
+
+I used Claude Code (the AI assistant built into my IDE) throughout this project. Here's an honest account of what it did, what was useful, and where I had to push back or verify things myself.
+
+**Reading and mapping the codebase.** I asked the AI to read every file in the project and summarize what each one did. This was genuinely useful for getting oriented quickly — it correctly identified that `notification_service.py` was doing double duty (both owning notification creation *and* acting as the business logic layer for rating and playlist operations), and it traced the full call chain from each route down to the service functions. I would have found this eventually by reading, but the AI saved me from jumping around between files manually.
+
+**Identifying the bugs.** I asked the AI to read the service files and flag anything suspicious. It found all five bugs and described them, which I'll be honest about: that's more than I would have spotted in the same amount of time on my own. Where I did my own work was in deciding whether each diagnosis was *correct* before committing to a fix. For Bug 2 (the feed threshold), the AI flagged the 24-hour window immediately, but I had to reason through the boundary myself — "if a friend listened at 10 PM last night and it's 9 PM tonight, does 24 hours include them?" — to confirm the diagnosis made sense, rather than just trusting the flag.
+
+**Understanding the streak logic.** I asked the AI to explain what `datetime.weekday()` returns in Python and trace through the `update_listening_streak()` function with Saturday and Sunday as inputs. It correctly explained that `weekday()` returns 6 for Sunday and walked through why the `!= 6` guard caused the else-branch to fire. This was the most useful AI explanation in the project — I could see the code, but having it trace through with concrete day values made the mismatch obvious.
+
+**Finding the missing notification (Bug 4).** The AI pointed me to compare `add_to_playlist()` and `rate_song()` side by side and noted that `rate_song()` was missing the `create_notification()` call. The README hint said "look at the pattern used for the working notification and compare line-by-line," which is exactly what the AI did. I verified this was correct by checking that no other code path (the route, any middleware) could have been firing the notification elsewhere — it wasn't.
+
+**Where I had to verify things myself.** For Bug 3 (search duplicates), the AI explained that the `outerjoin` produces one row per tag and that `.distinct()` would fix it. What it didn't initially explain was *why* the outer join was there in the first place — whether removing it or switching to a subquery might be safer. I looked at how `song.tags` is loaded in `to_dict()` (it uses the `song_tags` relationship defined on the model, not the join) and confirmed the join in `search_songs()` is only there for the filter, not for loading tag data. So `.distinct()` is safe and the join can stay. The AI's fix was right but its explanation skipped that step.
+
+**Writing the submission doc.** The AI drafted the codebase map and the root cause analysis entries based on the code it had read. I reviewed each entry and revised the root cause language to be more specific — the first draft of several entries described what the bug caused rather than the exact code condition that caused it. The AI usage section you're reading right now is the one piece I wrote without AI drafting it first, because describing the collaboration accurately requires knowing what actually happened.
+
+**Where the AI was not helpful.** I asked it to run the tests before and after each fix to confirm behavior. It can't run code directly, so I had to install the dependencies and run `pytest` myself. The AI also initially described Bug 5 (`songs[:-1]`) as a "typo," which is probably true, but didn't speculate on how it got there — I think it might have been an intentional off-by-one introduced as a planted bug, since `[:-1]` is an unusual thing to write by accident in a return statement. The AI didn't flag that distinction.
+
 ## Codebase Map
 
 ### Main Files and What Each One Does
