@@ -118,125 +118,99 @@ Creates 5 users, establishes friendships between them, inserts 25 songs with var
 
 ## Bug Fixes
 
-### Bug 1 — Streak Resets on Sunday
+---
 
-**File:** `services/streak_service.py`, line 73
+### Issue #1 — My listening streak keeps resetting
 
-**Root Cause:** The streak increment branch has an extra guard: `elif days_since_last == 1 and today.weekday() != 6`. `weekday() == 6` is Sunday. This condition means: "don't increment the streak if today is Sunday." When a user listens on Saturday and then Sunday, `days_since_last == 1` is true, but `today.weekday() != 6` is false — so the condition fails and the streak resets to 1 instead of incrementing. There is no valid reason to treat Sunday differently.
+**File:** [services/streak_service.py](services/streak_service.py), line 73
 
-**Fix:** Remove `and today.weekday() != 6`.
+**How I reproduced it:** I read `test_streak_increments_on_sunday` in `tests/test_streaks.py`, which uses Saturday (June 15, 2024, `weekday() == 5`) and Sunday (June 16, 2024, `weekday() == 6`) as inputs and asserts the streak reaches 2. Running the test before any fix: it failed with streak == 1 on Sunday, confirming that a Saturday → Sunday listen pair was resetting instead of incrementing.
 
-**Before:**
+**How I found the root cause:** I went straight to `services/streak_service.py` since the README pointed there. I read `update_listening_streak()` top to bottom. The logic has three branches based on `days_since_last`: 0 (same day), 1 (consecutive), and else (gap). The consecutive-day branch on line 73 read:
 ```python
 elif days_since_last == 1 and today.weekday() != 6:
-    user.listening_streak += 1
 ```
+The extra condition `today.weekday() != 6` immediately stood out as the culprit — Python's `datetime.weekday()` returns 6 for Sunday, so this guard literally says "skip the increment when today is Sunday."
 
-**After:**
-```python
-elif days_since_last == 1:
-    user.listening_streak += 1
-```
+**The root cause:** Python's `datetime.weekday()` returns integers 0 (Monday) through 6 (Sunday). The streak increment branch had an appended guard `and today.weekday() != 6`, which evaluates to `False` whenever the current day is Sunday. When a user listens on Saturday and then on Sunday, `days_since_last == 1` is True but `today.weekday() != 6` is False — so the whole `elif` is skipped and execution falls into the `else` branch, resetting the streak to 1. There is no domain reason to exclude Sunday from consecutive-day streaks; the condition has no valid justification.
 
-**Verified by:** `tests/test_streaks.py::test_streak_increments_on_sunday` — this test was already written and fails before the fix, passes after.
+**Fix and side-effect check:** Removed `and today.weekday() != 6` so the branch is simply `elif days_since_last == 1:`. I checked the surrounding logic: `days_since_last == 0` (same day, no change) and the `else` reset branch are unaffected. All five streak tests pass after the fix: `test_streak_starts_at_1_for_new_user`, `test_streak_increments_on_consecutive_day`, `test_streak_does_not_double_count_same_day`, `test_streak_resets_after_skipped_day`, and `test_streak_increments_on_sunday`.
 
 ---
 
-### Bug 2 — Friends Listening Now Shows Yesterday's Listeners
+### Issue #2 — Friends Listening Now shows people from yesterday
 
-**File:** `services/feed_service.py`, line 13
+**File:** [services/feed_service.py](services/feed_service.py), line 13
 
-**Root Cause:** `RECENT_THRESHOLD = timedelta(hours=24)` defines the window for "listening now." A 24-hour window includes events from yesterday: if a friend listened at 10 PM last night and it's currently 9 PM tonight (23 hours later), they appear as "listening now." The feature is called "listening now," so a 24-hour lookback is far too large. A 30-minute window matches what "now" means for an active listener.
+**How I reproduced it:** The bug is a threshold value, so I traced the logic mentally: if a friend listened at 10 PM on Tuesday and it's currently 9 PM on Wednesday, `datetime.now(UTC) - timedelta(hours=24)` produces a cutoff at 9 PM Tuesday. The friend's 10 PM Tuesday event is 23 hours old, which is >= cutoff, so they appear as "listening now." That's yesterday's data surfacing in a "now" feed. The scenario is reliably reproducible any time a friend listened 1–23 hours ago.
 
-**Fix:** Change `timedelta(hours=24)` to `timedelta(minutes=30)`.
+**How I found the root cause:** I opened `services/feed_service.py` and found `RECENT_THRESHOLD = timedelta(hours=24)` at the top of the file. `get_friends_listening_now()` computes `cutoff = datetime.now(timezone.utc) - RECENT_THRESHOLD` and filters `ListeningEvent.listened_at >= cutoff`. A 24-hour window is the only thing controlling what "now" means — if the threshold is 24 hours, yesterday's listeners appear today. The constant name `RECENT_THRESHOLD` and the feature name "listening now" made it obvious 24 hours was too broad.
 
-**Before:**
-```python
-RECENT_THRESHOLD = timedelta(hours=24)
-```
+**The root cause:** `RECENT_THRESHOLD = timedelta(hours=24)` makes "listening now" mean "anyone who listened in the past 24 hours." Since 24 hours crosses midnight, events from yesterday are always included unless the user has been active for a full day. A "listening now" feature should reflect the current session, not a full day's history.
 
-**After:**
-```python
-RECENT_THRESHOLD = timedelta(minutes=30)
-```
+**Fix and side-effect check:** Changed `timedelta(hours=24)` to `timedelta(minutes=30)`. A 30-minute window matches the intent of "currently listening." I checked `get_activity_feed()` in the same file — it is a separate function with its own `limit` parameter and no time window, so it is not affected by this constant. No existing tests cover the feed service, so no regressions to check there.
 
 ---
 
-### Bug 3 — Duplicate Songs in Search Results
+### Issue #3 — The same song keeps showing up twice in search
 
-**File:** `services/search_service.py`, line 27–35
+**File:** [services/search_service.py](services/search_service.py), lines 25–37
 
-**Root Cause:** `search_songs()` uses `.outerjoin(song_tags, Song.id == song_tags.c.song_id)` to join the tags association table. SQL joins produce one row per matching join pair — a song with 3 tags produces 3 rows, one per tag. SQLAlchemy's `.all()` returns all rows, so a song with N tags appears N times in the result list. A song with no tags appears once (the outer join keeps it with a NULL tag row). The fix is to add `.distinct()` so each Song object is returned only once.
+**How I reproduced it:** I ran `test_search_no_duplicates_multi_tag_song` before any fix. The test seeds a song ("Crown Heights Anthem") with three tags (rap, hip-hop, boom bap), searches for it by title, and asserts the result list contains exactly one entry with that title. The test failed with `len(matching) == 3` — one copy per tag. I also noticed `test_search_no_duplicates_single_tag_song` was passing (one tag → no duplicate), which confirmed the bug was conditional on having multiple tags.
 
-**Fix:** Add `.distinct()` to the query chain.
+**How I found the root cause:** I read `search_songs()` in `services/search_service.py`. The query joins `song_tags` with `.outerjoin(song_tags, Song.id == song_tags.c.song_id)` before filtering on title/artist. I knew immediately that a SQL join without deduplication returns one row per join match — a song with 3 tags joins 3 rows. SQLAlchemy's `.all()` materializes all rows as separate Song objects (SQLAlchemy deduplicates by identity in the session only when loading the same PK within the same query result, which it does not do here for the same object appearing multiple times). The fix was to add `.distinct()` to collapse duplicate rows before `.all()`.
 
-**Before:**
-```python
-results = (
-    db.session.query(Song)
-    .outerjoin(song_tags, Song.id == song_tags.c.song_id)
-    .filter(...)
-    .all()
-)
-```
+**The root cause:** The `outerjoin` on `song_tags` produces one SQL row per `(song_id, tag_id)` pair. A song with N tags produces N rows. SQLAlchemy's `.all()` returns one Python object per row, so the same Song appears N times in `results`. The outer join is needed for the tags relationship to load, but without `.distinct()` the SQL `SELECT` returns duplicate song rows that feed through to the Python list.
 
-**After:**
-```python
-results = (
-    db.session.query(Song)
-    .outerjoin(song_tags, Song.id == song_tags.c.song_id)
-    .filter(...)
-    .distinct()
-    .all()
-)
-```
+**Fix and side-effect check:** Added `.distinct()` between `.filter(...)` and `.all()`. This collapses the duplicate rows at the SQL level before SQLAlchemy materializes them. Songs with no tags still appear (the outer join produces a single NULL-tag row, which `.distinct()` keeps). Songs with multiple tags now appear once. I checked `get_song()` in the same file — it uses `db.session.get()` (PK lookup), completely unrelated. All five search tests pass after the fix.
 
-**Regression test:** `tests/test_search.py::test_search_no_duplicates_multi_tag_song` — already in the repo and fails before the fix, passes after.
+**Regression test:** `tests/test_search.py::test_search_no_duplicates_multi_tag_song` was already in the repo and directly tests this behavior. It fails before the fix and passes after.
 
 ---
 
-### Bug 4 — No Notification When a Song Is Rated
+### Issue #4 — I got notified when a friend added my song to a playlist, but not when they rated it
 
-**File:** `services/notification_service.py`, `rate_song()` function
+**File:** [services/notification_service.py](services/notification_service.py), `rate_song()` function
 
-**Root Cause:** This is an architectural omission. The `add_to_playlist()` function correctly calls `create_notification()` after performing its action. `rate_song()` performs the same type of social action (someone interacts with a song you shared), but never calls `create_notification()`. The notification infrastructure is all there — the function just doesn't use it. Comparing the two functions line-by-line makes the missing call obvious.
+**How I reproduced it:** I read `add_to_playlist()` and `rate_song()` side by side. `add_to_playlist()` calls `create_notification()` after its DB write. `rate_song()` calls `db.session.commit()` and then immediately `return rating` — no notification. To confirm this is the only difference, I traced the route: `POST /songs/<id>/rate` calls `rate_song()` and nothing else. There is no other place that could fire a "song_rated" notification.
 
-**Fix:** After committing the rating, add a notification for the song's sharer (when the rater is not the sharer).
+**How I found the root cause:** The README hint said "the root cause is architectural, not a typo — look at the pattern used for the working notification and compare it line-by-line to the missing one." I opened `notification_service.py` and read both functions. `add_to_playlist()` (lines 35–70) has this structure: validate inputs → perform DB action → call `create_notification()` → return. `rate_song()` (lines 73–110) has: validate inputs → perform DB action → commit → return. The call to `create_notification()` is simply absent. The infrastructure (`create_notification`, `Notification` model, `get_notifications`) is complete — the notification just was never triggered.
 
-**Added after `db.session.commit()`:**
-```python
-if song.shared_by != user_id:
-    create_notification(
-        user_id=song.shared_by,
-        notification_type="song_rated",
-        body=f"{rater.username} rated your song '{song.title}' {score}/5.",
-    )
-```
+**The root cause:** `rate_song()` saves and commits the Rating row but never calls `create_notification()`. The `add_to_playlist()` function in the same file demonstrates the correct pattern: after the data action, check whether the actor is the song's original sharer, and if not, fire a notification. `rate_song()` skips that step entirely. The omission is not a typo in an existing call — the call simply doesn't exist.
+
+**Fix and side-effect check:** Added a `create_notification()` call after `db.session.commit()` in `rate_song()`, guarded by `if song.shared_by != user_id` (so users don't get notified when they rate their own song, matching the pattern in `add_to_playlist()`). The notification type is `"song_rated"` and the body names the rater and the score. I checked: the `create_notification()` function does its own commit, which is safe after the Rating commit since they are independent rows. The `get_notifications()` and `mark_as_read()` functions are unaffected — they work on any Notification row regardless of type.
 
 ---
 
-### Bug 5 — Last Song in a Playlist Never Shows Up
+### Issue #5 — The last song in a playlist never shows up
 
-**File:** `services/playlist_service.py`, line 66
+**File:** [services/playlist_service.py](services/playlist_service.py), line 66
 
-**Root Cause:** `get_playlist_songs()` queries the database correctly and retrieves all songs in order. But the return statement uses `songs[:-1]` — Python's slice that means "all elements except the last one." A playlist with 5 songs returns 4; with 1 song it returns 0 (an empty list). This is a typo; `songs[:-1]` should be `songs`.
+**How I reproduced it:** I ran `test_playlist_returns_all_songs` before any fix. The test creates a playlist with 5 songs at positions 1–5 and asserts `len(songs) == 5`. It failed with `len(songs) == 4`. I also checked `test_playlist_returns_songs_in_order`, which asserts the titles are `["Track 1", "Track 2", "Track 3", "Track 4", "Track 5"]` — it failed because "Track 5" was missing.
 
-**Fix:** Change `songs[:-1]` to `songs`.
-
-**Before:**
+**How I found the root cause:** I read `get_playlist_songs()` in `services/playlist_service.py`. The SQL query (lines 58–64) is correct: it joins through `playlist_entries`, filters by `playlist_id`, and orders by `position` ascending. Then line 66:
 ```python
 return [song.to_dict() for song in songs[:-1]]
 ```
+`songs[:-1]` is a Python slice meaning "all elements except the last." The query returns the right data; the slice discards the final element.
 
-**After:**
-```python
-return [song.to_dict() for song in songs]
+**The root cause:** `songs[:-1]` is Python's "all but last" slice. A query returning N songs becomes N−1 songs before the list comprehension even runs. With 5 songs: returns 4. With 1 song: returns 0 (empty list). The SQL and the join logic are correct; the only problem is `[:-1]` where `[:]` (or no slice at all) was intended.
+
+**Fix and side-effect check:** Changed `songs[:-1]` to `songs` in the list comprehension. The query, join, and ordering are untouched. I verified `get_playlist()` (metadata only, no songs) and `get_user_playlists()` (returns Playlist objects, not song lists) are unrelated. All three playlist tests pass after the fix: `test_playlist_returns_all_songs`, `test_playlist_returns_songs_in_order`, and `test_empty_playlist_returns_empty_list`.
+
+---
+
+## Regression Test
+
+`tests/test_search.py::test_search_no_duplicates_multi_tag_song` is a regression test for Bug 3. It would have caught the bug before it was introduced: it seeds a song with 3 tags, runs a search, and asserts the result contains exactly one copy of that song (`assert len(matching) == 1`). With the bug present (no `.distinct()`), this test fails with `len(matching) == 3`. With the fix, it passes.
+
+The test is already in the repo. Run it with:
+```bash
+pytest tests/test_search.py::test_search_no_duplicates_multi_tag_song -v
 ```
-
-**Verified by:** `tests/test_playlists.py::test_playlist_returns_all_songs` — this test asserts `len(songs) == 5` and fails before the fix with 4, passes after.
 
 ---
 
 ## AI Tool Disclosure
 
-Claude Code was used to navigate the codebase (reading files and tracing call chains) and to draft this submission document. All bug identification and analysis was done by reading the actual source code. The bugs were confirmed by running the existing test suite before and after each fix.
+Claude Code was used to navigate the codebase (reading files, tracing call chains) and to draft this submission document. Bug identification was done by reading the actual source code. The existing test suite was run before and after each fix to confirm behavior.
